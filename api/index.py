@@ -10,7 +10,7 @@ from google import genai
 app = Flask(__name__)
 
 # Mengambil kunci dari Environment Variables Vercel
-bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
+bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"), threaded=False)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
