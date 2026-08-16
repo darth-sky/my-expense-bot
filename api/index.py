@@ -10,9 +10,15 @@ from google import genai
 app = Flask(__name__)
 
 # Mengambil kunci dari Environment Variables Vercel
-bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"), threaded=False)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+bot = telebot.TeleBot(TOKEN, threaded=False)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+# 🔒 KEAMANAN 1: DAFTAR USER YANG DIIZINKAN (Whitelist)
+# Ganti angka ini dengan ID Telegram-mu. 
+# Tambahkan juga ID Telegram Gung Diah (pisahkan dengan koma) jika kalian mencatat pengeluaran/tabungan bersama.
+ALLOWED_USERS = [5440248988] 
 
 # DAFTAR KATEGORI
 EXPENSE_CATS = ['Makan', 'Transport', 'Tagihan', 'Suplemen/Gym', 'Hiburan', 'Investasi', 'Lain-lain']
@@ -38,6 +44,12 @@ def parse_chat_with_ai(chat_text):
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     chat_id = message.chat.id
+    
+    # 🔒 SATPAM BERAKSI: Tolak jika ID tidak terdaftar
+    if chat_id not in ALLOWED_USERS:
+        bot.send_message(chat_id, "⛔ Akses Ditolak! Anda tidak memiliki izin untuk mengakses database keuangan ini.")
+        return
+
     text = message.text.strip().lower()
 
     if chat_id in pending_transactions:
@@ -109,11 +121,12 @@ def simpan_ke_supabase(chat_id, data):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "Bot Serverless Vercel Hidup 🚀"
+    return "Bot Serverless Vercel Hidup & Aman! 🚀"
 
-@app.route('/webhook', methods=['POST'])
+# 🔒 KEAMANAN 2: SECRET PATH
+# URL Webhook sekarang menggunakan Token Telegram-mu, sehingga mustahil ditebak peretas.
+@app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    # Telegram akan melempar data JSON ke rute ini
     if request.headers.get('content-type') == 'application/json':
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
