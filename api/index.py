@@ -178,7 +178,7 @@ def handle_message(message):
 def simpan_ke_supabase(chat_id, data):
     try:
         user_id = ALLOWED_USERS.get(chat_id)
-        if not user_id or user_id.startswith("f17f773a-5809-42ef-87ad-47a586c1b480"):
+        if not user_id or user_id.startswith("GANTI_DENGAN_UUID"):
             bot.send_message(chat_id, "⚠️ Konfigurasi user_id belum diisi di ALLOWED_USERS. Hubungi admin bot.")
             logger.error(f"user_id belum di-mapping untuk chat_id={chat_id}")
             return
