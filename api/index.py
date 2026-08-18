@@ -1,50 +1,132 @@
 import os
 import json
+import logging
+from datetime import datetime, timedelta
+
 import telebot
 from flask import Flask, request
-from datetime import datetime
 from supabase import create_client
 from google import genai
 
+# ==========================================
+# SETUP LOGGING (biar error kelihatan di log Vercel)
+# ==========================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("finance_bot")
+
+# ==========================================
 # Inisialisasi App Flask untuk Vercel Serverless
+# ==========================================
 app = Flask(__name__)
 
-# Mengambil kunci dari Environment Variables Vercel
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # baru: token rahasia webhook
+
 bot = telebot.TeleBot(TOKEN, threaded=False)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
-# 🔒 KEAMANAN 1: DAFTAR USER YANG DIIZINKAN (Whitelist)
-# Ganti angka ini dengan ID Telegram-mu. 
-# Tambahkan juga ID Telegram Gung Diah (pisahkan dengan koma) jika kalian mencatat pengeluaran/tabungan bersama.
-ALLOWED_USERS = [5440248988] 
+# 🔒 KEAMANAN 1: WHITELIST + MAPPING ke user_id Supabase
+# Sebelumnya cuma list ID Telegram. Sekarang di-map eksplisit ke user_id
+# di Supabase, supaya query wallet tidak bergantung pada "siapa yang
+# namanya nyangkut duluan di hasil ilike" saat ada >1 user berbagi bot.
+#
+# Ganti value "GANTI_DENGAN_UUID_..." dengan user_id asli dari tabel users/auth Supabase.
+ALLOWED_USERS = {
+    5440248988: "f17f773a-5809-42ef-87ad-47a586c1b480",
+    # 111111111: "GANTI_DENGAN_UUID_GUNG_DIAH",
+}
 
-# DAFTAR KATEGORI
 EXPENSE_CATS = ['Makan', 'Transport', 'Tagihan', 'Suplemen/Gym', 'Hiburan', 'Investasi', 'Lain-lain']
 INCOME_CATS = ['Gaji', 'Kupon Investasi', 'Bonus', 'Pencairan', 'Lain-lain']
 
-pending_transactions = {}
+MAX_REASONABLE_AMOUNT = 500_000_000  # sanity check, sesuaikan kalau perlu
 
-def parse_chat_with_ai(chat_text):
+
+# ==========================================
+# STATE MANAGEMENT (Supabase, bukan dict di memori)
+# Penting: di Vercel serverless, tiap request BISA jalan di instance
+# proses yang berbeda. Dict Python di memori tidak dijamin persisten
+# antar-request, jadi wajib disimpan ke database.
+# ==========================================
+def get_pending(chat_id: int):
+    res = supabase.table("pending_transactions").select("*").eq("chat_id", chat_id).execute()
+    if res.data:
+        return res.data[0]
+    return None
+
+
+def set_pending(chat_id: int, data: dict, cats: list):
+    supabase.table("pending_transactions").upsert({
+        "chat_id": chat_id,
+        "data": data,
+        "cats": cats,
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+
+def clear_pending(chat_id: int):
+    supabase.table("pending_transactions").delete().eq("chat_id", chat_id).execute()
+
+
+# ==========================================
+# PARSING DENGAN AI
+# ==========================================
+def parse_chat_with_ai(chat_text: str):
     prompt = f"""
     Kamu adalah asisten keuangan AI cerdas. Ekstrak pesan menjadi JSON.
-    1. "30" = 30000. Kalikan 1000 jika disingkat.
-    2. TIPE: transfer (pindah uang), income (dapat uang), expense (keluar uang).
-    3. KATEGORI: transfer HANYA "Transfer Internal". income HANYA {INCOME_CATS}. expense HANYA {EXPENSE_CATS}. Jika expense/income RAGU, isi "UNKNOWN".
-    4. DOMPET: wallet_name (asal), to_wallet_name (tujuan - HANYA transfer, selain itu isi "").
+
+    ATURAN STRUKTUR (Pola umum user: [Deskripsi/Item] [Nominal] [Dompet Asal]):
+    1. ANGKA: "30" = 30000, "101" = 101000. Kalikan 1000 jika disingkat.
+    2. TIPE (type):
+       - "transfer": JIKA ADA DUA DOMPET dan kata "ke" (contoh: "bca ke tunai 50").
+       - "income": JIKA MENDAPAT UANG (contoh: "gaji", "bonus").
+       - "expense": JIKA KELUAR UANG ATAU TOPUP E-WALLET (contoh: "shopeepay 101 dmnn", "topup 50 bri", "makan 20 tunai"). Topup e-wallet dihitung sebagai "expense" jika hanya menyebut 1 dompet asal.
+    3. DOMPET (wallet_name & to_wallet_name):
+       - wallet_name: Dompet SUMBER uang (BIASANYA KATA TERAKHIR). Jangan jadikan kata pertama (seperti shopeepay/topup/dana) sebagai dompet asal!
+       - to_wallet_name: Hanya diisi jika "transfer". Jika bukan, isi "".
+    4. KATEGORI (category):
+       - "transfer" = "Transfer Internal"
+       - "income" = Pilih HANYA dari {INCOME_CATS}.
+       - "expense" = Pilih HANYA dari {EXPENSE_CATS}. (Jika ragu, WAJIB isi "UNKNOWN").
+
+    CONTOH WAJIB DIIKUTI:
+    - Chat: "shopeepay 101 dmnn" -> desc="shopeepay", amount=101000, wallet_name="dmnn", type="expense", category="UNKNOWN".
+    - Chat: "topup 50 bca" -> desc="topup", amount=50000, wallet_name="bca", type="expense", category="UNKNOWN".
+    - Chat: "makan 20 tunai" -> desc="makan", amount=20000, wallet_name="tunai", type="expense", category="Makan".
+
     Chat: "{chat_text}"
-    Keys: "description", "amount", "wallet_name", "to_wallet_name", "category", "type".
+    Keys wajib: "description", "amount", "wallet_name", "to_wallet_name", "category", "type".
     """
     try:
-        response = ai_client.models.generate_content(model='gemini-3.1-flash-lite', contents=prompt)
-        return json.loads(response.text.replace('```json', '').replace('```', '').strip())
-    except: return None
+        response = ai_client.models.generate_content(model="gemini-3.1-flash-lite", contents=prompt)
+        clean = response.text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean)
+    except Exception as e:
+        logger.error(f"Gagal parsing AI untuk chat '{chat_text}': {e}")
+        return None
 
+    # Validasi dasar hasil AI sebelum dipakai
+    if not isinstance(parsed.get("amount"), (int, float)) or parsed["amount"] <= 0:
+        logger.warning(f"AI mengembalikan amount tidak valid: {parsed.get('amount')} untuk chat '{chat_text}'")
+        return None
+    if parsed["amount"] > MAX_REASONABLE_AMOUNT:
+        logger.warning(f"Amount melebihi batas wajar: {parsed['amount']} untuk chat '{chat_text}'")
+        return None
+    if parsed.get("type") not in ("expense", "income", "transfer"):
+        logger.warning(f"AI mengembalikan type tidak dikenal: {parsed.get('type')}")
+        return None
+
+    return parsed
+
+
+# ==========================================
+# HANDLER PESAN
+# ==========================================
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     chat_id = message.chat.id
-    
+
     # 🔒 SATPAM BERAKSI: Tolak jika ID tidak terdaftar
     if chat_id not in ALLOWED_USERS:
         bot.send_message(chat_id, "⛔ Akses Ditolak! Anda tidak memiliki izin untuk mengakses database keuangan ini.")
@@ -52,84 +134,152 @@ def handle_message(message):
 
     text = message.text.strip().lower()
 
-    if chat_id in pending_transactions:
-        data = pending_transactions[chat_id]['data']
-        cats_to_choose = pending_transactions[chat_id]['cats']
+    pending = get_pending(chat_id)
+    if pending:
+        data = pending["data"]
+        cats_to_choose = pending["cats"]
         try:
             pilihan = int(text) - 1
             if 0 <= pilihan < len(cats_to_choose):
-                data['category'] = cats_to_choose[pilihan]
+                data["category"] = cats_to_choose[pilihan]
                 simpan_ke_supabase(chat_id, data)
-                del pending_transactions[chat_id] 
-            else: bot.reply_to(message, "⚠️ Masukkan angka dari daftar.")
-        except: bot.reply_to(message, "⚠️ Masukkan angkanya saja.")
+                clear_pending(chat_id)
+            else:
+                bot.reply_to(message, "⚠️ Masukkan angka dari daftar.")
+        except ValueError:
+            bot.reply_to(message, "⚠️ Masukkan angkanya saja.")
+        except Exception as e:
+            logger.error(f"Error saat proses pending transaction chat_id={chat_id}: {e}")
+            bot.reply_to(message, "❌ Terjadi kesalahan, coba lagi.")
         return
 
     bot.send_message(chat_id, "⏳ Menganalisis...")
     parsed_data = parse_chat_with_ai(text)
-    
-    if not parsed_data:
-        return bot.reply_to(message, "❌ Gagal memahami pesan.")
 
-    if parsed_data.get('category') == 'UNKNOWN':
-        cats_to_choose = INCOME_CATS if parsed_data['type'] == 'income' else EXPENSE_CATS
-        pending_transactions[chat_id] = {'data': parsed_data, 'cats': cats_to_choose}
+    if not parsed_data:
+        bot.reply_to(message, "❌ Gagal memahami pesan. Coba diperjelas ya.")
+        return
+
+    if parsed_data.get("category") == "UNKNOWN":
+        cats_to_choose = INCOME_CATS if parsed_data["type"] == "income" else EXPENSE_CATS
+        set_pending(chat_id, parsed_data, cats_to_choose)
         pilihan_teks = f"🤔 '{parsed_data['description'].title()}' masuk mana?\n"
-        for i, k in enumerate(cats_to_choose): pilihan_teks += f"{i+1}. {k}\n"
-        return bot.reply_to(message, pilihan_teks)
+        for i, k in enumerate(cats_to_choose):
+            pilihan_teks += f"{i + 1}. {k}\n"
+        bot.reply_to(message, pilihan_teks)
+        return
 
     simpan_ke_supabase(chat_id, parsed_data)
 
+
+# ==========================================
+# SIMPAN KE SUPABASE
+# ==========================================
 def simpan_ke_supabase(chat_id, data):
     try:
-        wallet_name_query = data.get('wallet_name', '').strip()
-        if not wallet_name_query: return bot.send_message(chat_id, "⚠️ Sebutkan nama dompet asal.")
-            
-        wallet_res = supabase.table('wallets').select('id, name, user_id').ilike('name', f"%{wallet_name_query}%").execute()
-        if len(wallet_res.data) == 0: return bot.send_message(chat_id, f"⚠️ Dompet '{wallet_name_query}' tidak ditemukan.")
-            
-        w_id = wallet_res.data[0]['id']
-        w_name = wallet_res.data[0]['name']
-        u_id = wallet_res.data[0]['user_id'] 
+        user_id = ALLOWED_USERS.get(chat_id)
+        if not user_id or user_id.startswith("f17f773a-5809-42ef-87ad-47a586c1b480"):
+            bot.send_message(chat_id, "⚠️ Konfigurasi user_id belum diisi di ALLOWED_USERS. Hubungi admin bot.")
+            logger.error(f"user_id belum di-mapping untuk chat_id={chat_id}")
+            return
+
+        wallet_name_query = data.get("wallet_name", "").strip()
+        if not wallet_name_query:
+            bot.send_message(chat_id, "⚠️ Sebutkan nama dompet asal.")
+            return
+
+        # Filter berdasarkan user_id juga, bukan cuma nama, biar tidak
+        # ke-mix kalau ada 2 user dengan nama dompet yang mirip.
+        wallet_res = (
+            supabase.table("wallets")
+            .select("id, name, user_id")
+            .eq("user_id", user_id)
+            .ilike("name", f"%{wallet_name_query}%")
+            .execute()
+        )
+        if len(wallet_res.data) == 0:
+            bot.send_message(chat_id, f"⚠️ Dompet '{wallet_name_query}' tidak ditemukan.")
+            return
+
+        w_id = wallet_res.data[0]["id"]
+        w_name = wallet_res.data[0]["name"]
 
         to_w_id = None
         to_w_name = None
-        if data['type'] == 'transfer':
-            to_name_query = data.get('to_wallet_name', '').strip()
-            if not to_name_query: return bot.send_message(chat_id, "⚠️ Sebutkan dompet tujuan.")
-            to_res = supabase.table('wallets').select('id, name').ilike('name', f"%{to_name_query}%").execute()
-            if len(to_res.data) == 0: return bot.send_message(chat_id, f"⚠️ Dompet '{to_name_query}' tidak ditemukan.")
-            to_w_id = to_res.data[0]['id']
-            to_w_name = to_res.data[0]['name']
+        if data["type"] == "transfer":
+            to_name_query = data.get("to_wallet_name", "").strip()
+            if not to_name_query:
+                bot.send_message(chat_id, "⚠️ Sebutkan dompet tujuan.")
+                return
+            to_res = (
+                supabase.table("wallets")
+                .select("id, name")
+                .eq("user_id", user_id)
+                .ilike("name", f"%{to_name_query}%")
+                .execute()
+            )
+            if len(to_res.data) == 0:
+                bot.send_message(chat_id, f"⚠️ Dompet '{to_name_query}' tidak ditemukan.")
+                return
+            to_w_id = to_res.data[0]["id"]
+            to_w_name = to_res.data[0]["name"]
 
-        supabase.table('transactions').insert({
-            "type": data['type'], "amount": data['amount'], "category": data['category'],
-            "description": data['description'], "wallet_id": w_id, "to_wallet_id": to_w_id, 
-            "user_id": u_id, "transaction_date": datetime.today().strftime('%Y-%m-%d')
+        supabase.table("transactions").insert({
+            "type": data["type"],
+            "amount": data["amount"],
+            "category": data["category"],
+            "description": data["description"],
+            "wallet_id": w_id,
+            "to_wallet_id": to_w_id,
+            "user_id": user_id,
+            "transaction_date": datetime.today().strftime("%Y-%m-%d"),
         }).execute()
-        
-        rp = "{:,}".format(data['amount']).replace(',', '.')
-        if data['type'] == 'transfer':
-            bot.send_message(chat_id, f"🔄 **Transfer**\nRp {rp}\n📤 {w_name.title()} ➔ 📥 {to_w_name.title()}\n📝 {data['description'].title()}", parse_mode='Markdown')
+
+        rp = "{:,}".format(int(data["amount"])).replace(",", ".")
+        if data["type"] == "transfer":
+            bot.send_message(
+                chat_id,
+                f"🔄 **Transfer**\nRp {rp}\n📤 {w_name.title()} ➔ 📥 {to_w_name.title()}\n📝 {data['description'].title()}",
+                parse_mode="Markdown",
+            )
         else:
-            bot.send_message(chat_id, f"✅ **{'🟢 Masuk' if data['type'] == 'income' else '🔴 Keluar'}**\n📝 {data['description'].title()}\n💰 Rp {rp}\n📁 {data['category']}\n💳 {w_name.title()}", parse_mode='Markdown')
-    except Exception as e: bot.send_message(chat_id, f"❌ Error: {str(e)}")
+            label = "🟢 Masuk" if data["type"] == "income" else "🔴 Keluar"
+            bot.send_message(
+                chat_id,
+                f"✅ **{label}**\n📝 {data['description'].title()}\n💰 Rp {rp}\n📁 {data['category']}\n💳 {w_name.title()}",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"Gagal simpan transaksi chat_id={chat_id}: {e}")
+        bot.send_message(chat_id, "❌ Gagal menyimpan transaksi. Coba lagi atau hubungi admin.")
+
 
 # ==========================================
 # RUTINITAS FLASK & WEBHOOK UNTUK VERCEL
 # ==========================================
-
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def home():
     return "Bot Serverless Vercel Hidup & Aman! 🚀"
 
-# 🔒 KEAMANAN 2: SECRET PATH
-# URL Webhook sekarang menggunakan Token Telegram-mu, sehingga mustahil ditebak peretas.
-@app.route(f'/{TOKEN}', methods=['POST'])
+
+# 🔒 KEAMANAN 2: SECRET PATH + SECRET TOKEN
+# Selain URL yang mengandung TOKEN, sekarang juga divalidasi via header
+# resmi Telegram (X-Telegram-Bot-Api-Secret-Token). Set secret ini saat
+# register webhook: bot.set_webhook(url=..., secret_token=WEBHOOK_SECRET)
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
+    if WEBHOOK_SECRET:
+        incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if incoming_secret != WEBHOOK_SECRET:
+            logger.warning("Webhook ditolak: secret token tidak cocok.")
+            return "Forbidden", 403
+
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
+        try:
+            bot.process_new_updates([update])
+        except Exception as e:
+            logger.error(f"Error memproses update: {e}")
         return "OK", 200
     return "Forbidden", 403
