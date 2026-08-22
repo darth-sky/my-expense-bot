@@ -188,8 +188,7 @@ def simpan_ke_supabase(chat_id, data):
             bot.send_message(chat_id, "⚠️ Sebutkan nama dompet asal.")
             return
 
-        # Filter berdasarkan user_id juga, bukan cuma nama, biar tidak
-        # ke-mix kalau ada 2 user dengan nama dompet yang mirip.
+        # 1. Cari Dompet Asal
         wallet_res = (
             supabase.table("wallets")
             .select("id, name, user_id")
@@ -206,6 +205,8 @@ def simpan_ke_supabase(chat_id, data):
 
         to_w_id = None
         to_w_name = None
+        
+        # 2. Cari Dompet Tujuan (Jika Transfer)
         if data["type"] == "transfer":
             to_name_query = data.get("to_wallet_name", "").strip()
             if not to_name_query:
@@ -224,6 +225,7 @@ def simpan_ke_supabase(chat_id, data):
             to_w_id = to_res.data[0]["id"]
             to_w_name = to_res.data[0]["name"]
 
+        # 3. Masukkan Transaksi Baru
         supabase.table("transactions").insert({
             "type": data["type"],
             "amount": data["amount"],
@@ -235,24 +237,51 @@ def simpan_ke_supabase(chat_id, data):
             "transaction_date": datetime.today().strftime("%Y-%m-%d"),
         }).execute()
 
-        rp = "{:,}".format(int(data["amount"])).replace(",", ".")
+        # 4. AMBIL SALDO TERBARU DARI TABEL VIRTUAL (wallet_balances)
+        sisa_saldo_asal = 0
+        res_asal = supabase.table("wallet_balances").select("balance").eq("wallet_id", w_id).execute()
+        if res_asal.data:
+            sisa_saldo_asal = res_asal.data[0]["balance"]
+
+        sisa_saldo_tujuan = 0
+        if data["type"] == "transfer" and to_w_id:
+            res_tujuan = supabase.table("wallet_balances").select("balance").eq("wallet_id", to_w_id).execute()
+            if res_tujuan.data:
+                sisa_saldo_tujuan = res_tujuan.data[0]["balance"]
+
+        # 5. Format Angka ke Rupiah
+        rp_amount = "{:,}".format(int(data["amount"])).replace(",", ".")
+        rp_asal = "{:,}".format(int(sisa_saldo_asal)).replace(",", ".")
+        rp_tujuan = "{:,}".format(int(sisa_saldo_tujuan)).replace(",", ".")
+
+        # 6. Susun Pesan Laporan
         if data["type"] == "transfer":
-            bot.send_message(
-                chat_id,
-                f"🔄 **Transfer**\nRp {rp}\n📤 {w_name.title()} ➔ 📥 {to_w_name.title()}\n📝 {data['description'].title()}",
-                parse_mode="Markdown",
+            pesan = (
+                f"🔄 **Transfer Berhasil**\n"
+                f"Rp {rp_amount}\n"
+                f"📤 {w_name.title()} ➔ 📥 {to_w_name.title()}\n"
+                f"📝 {data['description'].title()}\n\n"
+                f"📊 **Update Saldo:**\n"
+                f"- {w_name.title()}: Rp {rp_asal}\n"
+                f"- {to_w_name.title()}: Rp {rp_tujuan}"
             )
         else:
             label = "🟢 Masuk" if data["type"] == "income" else "🔴 Keluar"
-            bot.send_message(
-                chat_id,
-                f"✅ **{label}**\n📝 {data['description'].title()}\n💰 Rp {rp}\n📁 {data['category']}\n💳 {w_name.title()}",
-                parse_mode="Markdown",
+            pesan = (
+                f"✅ **{label}**\n"
+                f"📝 {data['description'].title()}\n"
+                f"💰 Rp {rp_amount}\n"
+                f"📁 {data['category']}\n"
+                f"💳 {w_name.title()}\n\n"
+                f"📊 Saldo sekarang: Rp {rp_asal}"
             )
+            
+        bot.send_message(chat_id, pesan, parse_mode="Markdown")
+        
     except Exception as e:
         logger.error(f"Gagal simpan transaksi chat_id={chat_id}: {e}")
         bot.send_message(chat_id, "❌ Gagal menyimpan transaksi. Coba lagi atau hubungi admin.")
-
+        
 
 # ==========================================
 # RUTINITAS FLASK & WEBHOOK UNTUK VERCEL
